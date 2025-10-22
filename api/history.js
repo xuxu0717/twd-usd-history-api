@@ -16,43 +16,53 @@ export default async function handler(req, res) {
       }
     }).then(r => r.text());
 
-    // basic checks
-    const hasTable = /<table[^>]*>/.test(html);
-    const hasRows = /<tr[^>]*>/.test(html);
-    const hasDateCell = /data-table="日期"/.test(html);
-    const hasSightCell = /class="rate-content-sight/.test(html);
-
-    if (!(hasTable && hasRows && hasDateCell && hasSightCell)) {
+    // 抓出 data-local='...'
+    const dlMatch = html.match(/data-local='([\s\S]*?)'/);
+    if (!dlMatch) {
       res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.status(502).json({
-        error: "頁面未包含期望的表格元素，可能為動態載入或遭到阻擋",
-        checks: { hasTable, hasRows, hasDateCell, hasSightCell },
-        hint: "請用 /api/debug 檢視實際 HTML，或改用替代來源"
-      });
+      return res.status(502).json({ error: "找不到 data-local JSON" });
     }
 
+    // 解析 JSON（頁面使用單引號包裹，內容為標準 JSON）
+    let dataLocal;
+    try {
+      dataLocal = JSON.parse(dlMatch[1]);
+    } catch (e) {
+      // 有時內容含單引號或跳脫字元，嘗試修正
+      const fixed = dlMatch[1]
+        .replace(/\\'/g, "'")
+        .replace(/\n/g, "\\n");
+      dataLocal = JSON.parse(fixed);
+    }
+
+    // 找到本行賣出系列
+    const sellSeries = (dataLocal.series || []).find(s => s.name === "本行賣出");
+    if (!sellSeries || !Array.isArray(sellSeries.data)) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.status(502).json({ error: "找不到本行賣出資料" });
+    }
+
+    // 映射成 { YYYY-MM-DD: rate }
+    const toDate = ms => {
+      const d = new Date(ms);
+      const y = d.getUTCFullYear();
+      const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+      const day = String(d.getUTCDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    };
+
     const results = {};
-    const trRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/g;
-    let tr;
-    while ((tr = trRegex.exec(html)) !== null) {
-      const row = tr[1];
-
-      const dateMatch = row.match(/<td[^>]*data-table="日期"[^>]*>(\d{4}\/\d{2}\/\d{2})<\/td>/);
-      if (!dateMatch) continue;
-      const date = dateMatch[1].replace(/\//g, "-");
-
-      // four numbers in order: 現金買入, 現金賣出, 即期買入, 即期賣出
-      const nums = [...row.matchAll(/<td[^>]*class="rate-content-sight\s+text-right\s+print_hide"[^>]*>([\d.,]+)<\/td>/g)]
-        .map(m => parseFloat(m[1].replace(/,/g, "")));
-
-      if (nums.length >= 4 && Number.isFinite(nums[3])) {
-        results[date] = nums[3];
+    for (const [ts, rate] of sellSeries.data) {
+      const date = toDate(ts);
+      // 僅保留查詢月份
+      if (date.startsWith(month)) {
+        results[date] = Number(rate);
       }
     }
 
     res.setHeader("Access-Control-Allow-Origin", "*");
     return res.status(200).json(results);
   } catch (err) {
-    return res.status(500).json({ error: "抓取失敗", details: err.message });
+    res.status(500).json({ error: "抓取失敗", details: err.message });
   }
 }
