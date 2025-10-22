@@ -1,27 +1,27 @@
 export default async function handler(req, res) {
   const { month } = req.query;
   if (!month || !/^\d{4}-\d{2}$/.test(month)) {
-    return res.status(400).json({ error: "請提供正確的月份格式，例如 ?month=2025-09" });
+    return res.status(400).json({ error: "請提供正確的月份格式，例如 ?month=2025-08" });
   }
 
-  const results = {};
-  const [year, mon] = month.split("-");
-  const daysInMonth = new Date(year, mon, 0).getDate();
+  const url = `https://rate.bot.com.tw/xrt/quote/${month}/USD`;
+  try {
+    const html = await fetch(url).then(r => r.text());
 
-  for (let day = 1; day <= daysInMonth; day++) {
-    const date = `${month}-${String(day).padStart(2, "0")}`;
-    const url = `https://rate.bot.com.tw/xrt/history?Lang=zh-TW&date=${date}&currency=USD`;
+    // 用正則擷取表格中的日期與即期賣出價
+    const regex = /(\d{4}\/\d{2}\/\d{2}).*?USD.*?<td[^>]*>([\d.]+)<\/td>\s*<td[^>]*>([\d.]+)<\/td>\s*<td[^>]*>([\d.]+)<\/td>\s*<td[^>]*>([\d.]+)<\/td>/g;
 
-    try {
-      const html = await fetch(url).then(r => r.text());
-      const match = html.match(/<td class="rate-content-sight text-right print_hide"[^>]*>([\d.]+)<\/td>/);
-      const rate = match ? parseFloat(match[1]) : null;
-      results[date] = rate || null;
-    } catch {
-      results[date] = null;
+    const results = {};
+    let match;
+    while ((match = regex.exec(html)) !== null) {
+      const date = match[1].replace(/\//g, "-"); // 轉成 YYYY-MM-DD
+      const spotSelling = parseFloat(match[5]); // 即期賣出價
+      results[date] = spotSelling;
     }
-  }
 
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.status(200).json(results);
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.status(200).json(results);
+  } catch (err) {
+    res.status(500).json({ error: "抓取失敗", details: err.message });
+  }
 }
