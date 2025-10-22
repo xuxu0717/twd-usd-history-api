@@ -5,17 +5,18 @@ export default async function handler(req, res) {
   }
 
   const url = `https://rate.bot.com.tw/xrt/quote/${month}/USD`;
+
   try {
     const html = await fetch(url).then(r => r.text());
 
-    // 用正則擷取表格中的日期與即期賣出價
-    const regex = /(\d{4}\/\d{2}\/\d{2}).*?USD.*?<td[^>]*>([\d.]+)<\/td>\s*<td[^>]*>([\d.]+)<\/td>\s*<td[^>]*>([\d.]+)<\/td>\s*<td[^>]*>([\d.]+)<\/td>/g;
+    // 擷取表格中的日期與即期賣出價
+    const regex = /(\d{4}\/\d{2}\/\d{2}).*?<td class="rate-content-sight text-right print_hide"[^>]*>([\d.]+)<\/td>/g;
 
     const results = {};
     let match;
     while ((match = regex.exec(html)) !== null) {
       const date = match[1].replace(/\//g, "-"); // 轉成 YYYY-MM-DD
-      const spotSelling = parseFloat(match[5]); // 即期賣出價
+      const spotSelling = parseFloat(match[2]);  // 即期賣出價
       results[date] = spotSelling;
     }
 
