@@ -9,9 +9,9 @@ export default async function handler(req, res) {
   try {
     const html = await fetch(url).then(r => r.text());
 
+    const results = {};
     // 抓出每一列 <tr>
     const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/g;
-    const results = {};
     let rowMatch;
 
     while ((rowMatch = rowRegex.exec(html)) !== null) {
@@ -19,12 +19,16 @@ export default async function handler(req, res) {
 
       // 日期
       const dateMatch = row.match(/<td data-table="日期">([\d/]+)<\/td>/);
-      // 即期賣出價（通常是第 5 個 rate-content-sight）
+      if (!dateMatch) continue;
+
+      const date = dateMatch[1].replace(/\//g, "-");
+
+      // 找出所有「即期」欄位
       const cells = [...row.matchAll(/<td class="rate-content-sight text-right print_hide"[^>]*>([\d.]+)<\/td>/g)];
 
-      if (dateMatch && cells.length >= 2) {
-        const date = dateMatch[1].replace(/\//g, "-");
-        const spotSelling = parseFloat(cells[1][1]); // 第二個是「即期賣出價」
+      // cells[0] = 即期買入價, cells[1] = 即期賣出價
+      if (cells.length >= 2) {
+        const spotSelling = parseFloat(cells[1][1]);
         results[date] = spotSelling;
       }
     }
