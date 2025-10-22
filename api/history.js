@@ -14,7 +14,7 @@ export default async function handler(req, res) {
 
     try {
       const html = await fetch(url).then(r => r.text());
-      const match = html.match(/即期賣出價.*?<td[^>]*>([\d.]+)<\/td>/);
+      const match = html.match(/<td class="rate-content-sight text-right print_hide"[^>]*>([\d.]+)<\/td>/);
       const rate = match ? parseFloat(match[1]) : null;
       results[date] = rate || null;
     } catch {
