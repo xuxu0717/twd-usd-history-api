@@ -19,40 +19,20 @@ function msToDate(ms) {
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 }
-function median(arr) {
-  const a = arr.filter(v => Number.isFinite(v)).slice().sort((x,y)=>x-y);
-  if (!a.length) return NaN;
-  const mid = Math.floor(a.length/2);
-  return a.length%2 ? a[mid] : (a[mid-1]+a[mid])/2;
+function parseNumber(str) {
+  if (str == null) return NaN;
+  const cleaned = String(str).replace(/[,\s]/g, "").trim();
+  return cleaned === "" ? NaN : Number(cleaned);
 }
 
 export default async function handler(req, res) {
-  const { month, ref = null, tol = "0.03" } = req.query;
+  const { month } = req.query;
   if (!month || !/^\d{4}-\d{2}$/.test(month)) {
     return res.status(400).json({ error: "請提供正確的月份格式，例如 ?month=2025-08" });
   }
 
-  // optional reference matches: comma-separated date:value pairs, e.g. ref=2025-08-28:30.63,2025-08-29:30.64
-  const refs = [];
-  if (ref) {
-    for (const part of String(ref).split(",")) {
-      const m = part.split(":");
-      if (m.length === 2) {
-        const d = m[0].trim();
-        const v = Number(m[1].trim());
-        if (/^\d{4}-\d{2}-\d{2}$/.test(d) && Number.isFinite(v)) refs.push({ date: d, value: v });
-      }
-    }
-  } else {
-    // 你先前提供的樣本（預設參考），可覆蓋或用 query 傳入
-    refs.push({ date: `${month}-28`, value: 30.63 });
-    refs.push({ date: `${month}-29`, value: 30.64 });
-    refs.push({ date: `${month}-01`, value: 30.065 });
-  }
-
-  const tolerance = Math.max(0, Number(tol) || 0.03);
-
   const url = `https://rate.bot.com.tw/xrt/quote/${month}`;
+
   try {
     const resp = await fetch(url, {
       headers: {
@@ -63,10 +43,57 @@ export default async function handler(req, res) {
     const htmlRaw = await resp.text();
     const html = htmlEntityDecode(htmlRaw);
 
+    const results = {};
+
+    // 1) 以 table row 解析：遍歷每個 <tr ...>...</tr>
+    const trRegex = /<tr\b([^>]*)>([\s\S]*?)<\/tr>/gi;
+    let trMatch;
+    while ((trMatch = trRegex.exec(html)) !== null) {
+      const trAttrs = trMatch[1] || "";
+      const trInner = trMatch[2] || "";
+
+      // 1.a 取日期：優先 data-date 屬性
+      let date = null;
+      const dataDateMatch = trAttrs.match(/data-date=["']?(\d{4}[\/-]\d{2}[\/-]\d{2})["']?/i);
+      if (dataDateMatch) date = dataDateMatch[1].replace(/\//g, "-");
+      if (!date) {
+        // 從 trInner 找任何 YYYY-MM-DD 或 YYYY/MM/DD
+        const anyDate = trInner.match(/(\d{4}[\/-]\d{2}[\/-]\d{2})/);
+        if (anyDate) date = anyDate[1].replace(/\//g, "-");
+      }
+      if (!date || !date.startsWith(month)) continue;
+
+      // 1.b 在該 tr 內尋找 class 包含指定字串的 td
+      // 允許 class 屬性順序不同或多空白，使用正則容錯
+      const targetTdRegex = /<td\b([^>]*)>([\s\S]*?)<\/td>/gi;
+      let tdMatch;
+      while ((tdMatch = targetTdRegex.exec(trInner)) !== null) {
+        const tdAttrs = tdMatch[1] || "";
+        const tdInner = tdMatch[2] || "";
+        // 檢查 class 是否包含指定 token（全部或部分）
+        if (/rate-content-sight/.test(tdAttrs) && /print_table-cell/.test(tdAttrs) && /hidden-phone/.test(tdAttrs)) {
+          // 去除內部 html tag 只保留文字
+          const text = tdInner.replace(/<[^>]+>/g, "").trim();
+          const num = parseNumber(text);
+          if (Number.isFinite(num)) {
+            results[date] = num;
+            break;
+          }
+        }
+      }
+    }
+
+    // 2) 若解析到資料則回傳
+    if (Object.keys(results).length > 0) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.status(200).json({ source: url, month, method: "tr-td-class-parse", rates: results });
+    }
+
+    // 3) 回退到 data-local JSON（舊有穩定方案）
     const dlMatch = html.match(/data-local=(['"])([\s\S]*?)\1/);
     if (!dlMatch) {
       res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.status(502).json({ error: "找不到 data-local 區塊" });
+      return res.status(502).json({ error: "表格解析失敗且找不到 data-local" });
     }
 
     let decoded = htmlEntityDecode(dlMatch[2]);
@@ -79,78 +106,28 @@ export default async function handler(req, res) {
         dataLocal = JSON.parse(fixed);
       } catch (err2) {
         res.setHeader("Access-Control-Allow-Origin", "*");
-        return res.status(500).json({ error: "JSON 解析失敗", details: err2.message });
+        return res.status(500).json({ error: "data-local 解析失敗", details: err2.message });
       }
     }
 
+    // 回傳所有 series 讓你選 index
     const series = Array.isArray(dataLocal.series) ? dataLocal.series : [];
-    if (!series.length) {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.status(502).json({ error: "data-local 中無 series" });
-    }
-
-    // 準備每個 series 的 month rates map
-    const meta = series.map((s, idx) => {
+    const out = series.map((s, idx) => {
       const name = s && s.name ? String(s.name) : null;
-      const map = {};
-      const vals = [];
+      const rates = {};
       if (Array.isArray(s && s.data)) {
-        for (const pt of s.data) {
-          if (!Array.isArray(pt) || pt.length < 2) continue;
-          const d = msToDate(pt[0]);
-          if (d.startsWith(month)) {
-            map[d] = Number(pt[1]);
-            vals.push(Number(pt[1]));
-          }
+        for (const point of s.data) {
+          if (!Array.isArray(point) || point.length < 2) continue;
+          const date = msToDate(point[0]);
+          if (date.startsWith(month)) rates[date] = Number(point[1]);
         }
       }
-      return { index: idx, name, rates: map, median: median(vals), sampleCount: Object.keys(map).length };
+      return { index: idx, name, sampleCount: Array.isArray(s && s.data) ? s.data.length : 0, rates };
     });
 
-    // 比對每個 series 與參考 refs，看哪個 series 命中數最多（允許容差 tolerance）
-    const scored = meta.map(m => {
-      let hits = 0;
-      for (const r of refs) {
-        const v = m.rates[r.date];
-        if (Number.isFinite(v) && Math.abs(v - r.value) <= tolerance) hits++;
-      }
-      return { index: m.index, name: m.name, hits, median: m.median, sampleCount: m.sampleCount };
-    });
-
-    // 依 hits 排序，若相同則用 sampleCount 與 median 作次排序
-    scored.sort((a,b) => {
-      if (b.hits !== a.hits) return b.hits - a.hits;
-      if (b.sampleCount !== a.sampleCount) return b.sampleCount - a.sampleCount;
-      if (Number.isFinite(a.median) && Number.isFinite(b.median)) return a.median - b.median;
-      return 0;
-    });
-
-    const best = scored[0];
-
-    // 若最佳匹配 hits 為 0，表示沒有 series 明確匹配任何參考，改回傳所有 series summary 讓你人工選 index
-    if (!best || best.hits === 0) {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.status(200).json({
-        note: "no series matched the provided references within tolerance; please inspect seriesSummary and pick index",
-        month,
-        url,
-        tolerance,
-        refs,
-        seriesSummary: meta.map(m => ({ index: m.index, name: m.name, sampleCount: m.sampleCount, median: m.median, sampleDates: Object.keys(m.rates).slice(0,5) }))
-      });
-    }
-
-    // 若有最佳 match，回傳該 series 的 rates
-    const chosen = meta.find(m => m.index === best.index);
     res.setHeader("Access-Control-Allow-Origin", "*");
-    return res.status(200).json({
-      sourceUrl: url,
-      month,
-      chosen: { index: chosen.index, name: chosen.name, hits: best.hits, median: chosen.median, sampleCount: chosen.sampleCount },
-      refs,
-      tolerance,
-      rates: chosen.rates
-    });
+    return res.status(200).json({ source: url, month, method: "fallback-data-local", series: out });
+
   } catch (err) {
     res.setHeader("Access-Control-Allow-Origin", "*");
     return res.status(500).json({ error: "抓取失敗", details: err.message });
