@@ -21,6 +21,22 @@ function msToDate(ms) {
   return `${y}-${m}-${day}`;
 }
 
+function pickSpotSeries(seriesArr) {
+  if (!Array.isArray(seriesArr) || seriesArr.length === 0) return null;
+
+  // 1) 優先找明確標示為「本行賣出」或包含「即期」關鍵字的 series
+  const prefer = seriesArr.find(s => s && typeof s.name === 'string' &&
+    (/本行賣出/.test(s.name) || /即期/.test(s.name) || /即期賣出/.test(s.name)));
+  if (prefer) return prefer;
+
+  // 2) 如果沒找到，排除掉包含「現金」關鍵字的 series，取第一個非現金的
+  const nonCash = seriesArr.find(s => s && typeof s.name === 'string' && !/現金/.test(s.name));
+  if (nonCash) return nonCash;
+
+  // 3) 最後備援：回第一個 series（保守做法）
+  return seriesArr[0];
+}
+
 export default async function handler(req, res) {
   const { month } = req.query;
   if (!month || !/^\d{4}-\d{2}$/.test(month)) {
@@ -65,15 +81,22 @@ export default async function handler(req, res) {
     }
 
     const series = Array.isArray(dataLocal.series) ? dataLocal.series : [];
-    const sellSeries = series.find(s => s.name === "本行賣出");
-    if (!sellSeries || !Array.isArray(sellSeries.data)) {
+    if (!series.length) {
       res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.status(502).json({ error: "找不到本行賣出資料" });
+      return res.status(502).json({ error: "data-local 中無 series" });
+    }
+
+    const spotSeries = pickSpotSeries(series);
+    if (!spotSeries || !Array.isArray(spotSeries.data)) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.status(502).json({ error: "找不到即期（本行賣出）系列資料" });
     }
 
     const results = {};
-    for (const [ts, rate] of sellSeries.data) {
-      const date = msToDate(ts);
+    for (const point of spotSeries.data) {
+      if (!Array.isArray(point) || point.length < 2) continue;
+      const [ts, rate] = point;
+      const date = msToDate(Number(ts));
       if (date.startsWith(month)) {
         results[date] = Number(rate);
       }
@@ -82,6 +105,6 @@ export default async function handler(req, res) {
     res.setHeader("Access-Control-Allow-Origin", "*");
     return res.status(200).json(results);
   } catch (err) {
-    res.status(500).json({ error: "抓取失敗", details: err.message });
+    return res.status(500).json({ error: "抓取失敗", details: err.message });
   }
 }
