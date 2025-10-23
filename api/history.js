@@ -1,3 +1,5 @@
+// api/history.js
+
 function htmlEntityDecode(str) {
   return str
     .replace(/&quot;/g, '"')
@@ -21,6 +23,12 @@ function parseNumber(str) {
   return cleaned === "" ? NaN : Number(cleaned);
 }
 
+function fixJsonQuotes(jsonStr) {
+  return jsonStr
+    .replace(/([{,]\s*)'([^']+)'(\s*:)/g, '$1"$2"$3')
+    .replace(/:\s*'([^']*)'/g, ': "$1"');
+}
+
 export default async function handler(req, res) {
   const { month } = req.query;
   if (!month || !/^\d{4}-\d{2}$/.test(month)) {
@@ -42,91 +50,144 @@ export default async function handler(req, res) {
     const htmlRaw = await resp.text();
     const html = htmlEntityDecode(htmlRaw);
 
-    // 1) 解析表頭 th，找出文字為「本行賣出」的欄位 index（在表格的 th 序列中）
-    // 支援 class 或無 class 情況：用正則抓出 <th ...>...</th>，並取 inner text
-    const thRegex = /<th\b[^>]*>([\s\S]*?)<\/th>/gi;
-    const ths = [];
-    let thMatch;
-    while ((thMatch = thRegex.exec(html)) !== null) {
-      // 去除 tag 內的 HTML 留下純文字（簡單移除所有標籤）
-      const inner = thMatch[1].replace(/<[^>]+>/g, "").trim();
-      ths.push(inner);
-    }
+    // 1) 嘗試以表格表頭定位「本行賣出」欄位
+    // 找出所有 <table ...>...</table> 片段，逐一檢查該 table 的 thead th 是否含 target
+    const tables = [...html.matchAll(/<table\b[^>]*>([\s\S]*?)<\/table>/gi)].map(m => m[0]);
+    const targetThClass = 'rate-content-sight print_table-cell hidden-phone';
+    const targetText = '本行賣出';
 
-    // 若無 th，退回嘗試從 data-local
-    if (!ths || ths.length === 0) {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.status(502).json({ error: "頁面未包含表頭 th，可能為動態載入或表格結構異動" });
-    }
+    let found = false;
+    let results = {};
+    let debug = { tableCount: tables.length, checkedTables: 0, matchedTableIndex: -1, matchedThIndex: -1, thTextsSample: [] };
 
-    // 找出本行賣出所在的 index
-    const targetName = "本行賣出";
-    let targetIndex = -1;
-    for (let i = 0; i < ths.length; i++) {
-      if (ths[i] && ths[i].includes(targetName)) {
-        targetIndex = i;
-        break;
+    for (let ti = 0; ti < tables.length; ti++) {
+      const tableHtml = tables[ti];
+      debug.checkedTables++;
+
+      // 擷取該 table 的 thead 內所有 th（若無 thead 也抓所有 th）
+      const theadMatch = tableHtml.match(/<thead\b[^>]*>([\s\S]*?)<\/thead>/i);
+      const thContainer = theadMatch ? theadMatch[1] : tableHtml;
+      const ths = [...thContainer.matchAll(/<th\b[^>]*>([\s\S]*?)<\/th>/gi)].map(m => m[1].replace(/<[^>]+>/g, "").trim());
+      debug.thTextsSample = debug.thTextsSample.concat(ths.slice(0, 20));
+
+      // 同時檢查完整 th 原始標籤，以便比對 class + innerText
+      const thTagMatches = [...thContainer.matchAll(/<th\b([^>]*)>([\s\S]*?)<\/th>/gi)].map(m => ({ attrs: m[1], inner: m[2] }));
+
+      // 找出第幾個 th 的 inner text 包含 targetText 且 attrs 含 targetThClass（寬鬆匹配）
+      let thIndex = -1;
+      for (let i = 0; i < thTagMatches.length; i++) {
+        const attrs = thTagMatches[i].attrs || "";
+        const innerText = (thTagMatches[i].inner || "").replace(/<[^>]+>/g, "").trim();
+        if (innerText.includes(targetText) && attrs.includes('rate-content-sight') && attrs.includes('hidden-phone')) {
+          thIndex = i;
+          break;
+        }
       }
-    }
 
-    if (targetIndex === -1) {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.status(502).json({ error: `找不到表頭 "${targetName}"，表頭列表已回傳供檢查`, thsSample: ths.slice(0, 30) });
-    }
-
-    // 2) 解析每一列 tr，收集同一欄位 index 的 td 值
-    // 抓出 table body 內的 tr 序列（但頁面可能有多個 table，這裡抓所有 tr）
-    const trRegex = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
-    const results = {};
-    let trMatch;
-    while ((trMatch = trRegex.exec(html)) !== null) {
-      const trInner = trMatch[1];
-
-      // 取出該 tr 裡所有 td 的文字（去 tag）
-      const tdMatches = [...trInner.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map(m => m[1].replace(/<[^>]+>/g, "").trim());
-
-      if (tdMatches.length === 0) continue;
-
-      // 日期欄位通常會有 data-table="日期" 或第一個 td 是日期，可嘗試先找 data-table="日期"
-      // 先嘗試用正則從 trInner 找 data-table="日期"
-      let date = null;
-      const dateMatch = trInner.match(/<td\b[^>]*data-table=["']?日期["']?[^>]*>([\s\S]*?)<\/td>/i);
-      if (dateMatch) {
-        date = dateMatch[1].replace(/<[^>]+>/g, "").trim().replace(/\//g, "-");
-      } else {
-        // 若沒有 data-table，嘗試把第一個 td 視為日期（若格式符合 YYYY/MM/DD 或 YYYY-MM-DD）
-        const first = tdMatches[0] || "";
-        const d1 = first.replace(/\s+/g, "");
-        if (/^\d{4}[\/-]\d{2}[\/-]\d{2}$/.test(d1)) {
-          date = d1.replace(/\//g, "-");
-        } else {
-          // 若第一欄不是日期，嘗試找任何欄位匹配日期格式
-          for (const cell of tdMatches) {
-            const c = cell.replace(/\s+/g, "");
-            if (/^\d{4}[\/-]\d{2}[\/-]\d{2}$/.test(c)) {
-              date = c.replace(/\//g, "-");
-              break;
-            }
+      if (thIndex === -1) {
+        // 如果沒有 class 完整匹配，也嘗試只比對 inner text（容錯）
+        for (let i = 0; i < thTagMatches.length; i++) {
+          const innerText = (thTagMatches[i].inner || "").replace(/<[^>]+>/g, "").trim();
+          if (innerText.includes(targetText)) {
+            thIndex = i;
+            break;
           }
         }
       }
 
-      if (!date) continue;
+      if (thIndex === -1) continue; // 該 table 未命中
 
-      // 若 targetIndex 超過 tdMatches 長度，跳過
-      if (targetIndex < 0 || targetIndex >= tdMatches.length) continue;
+      // 若命中，解析該 table 的 tbody 或所有 tr
+      debug.matchedTableIndex = ti;
+      debug.matchedThIndex = thIndex;
+      found = true;
 
-      const rawVal = tdMatches[targetIndex];
-      const num = parseNumber(rawVal);
-      if (!Number.isFinite(num)) continue;
+      const tbodyMatch = tableHtml.match(/<tbody\b[^>]*>([\s\S]*?)<\/tbody>/i);
+      const rowsSource = tbodyMatch ? tbodyMatch[1] : tableHtml;
+      const trMatches = [...rowsSource.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)];
 
-      // 僅保留查詢月份
-      if (date.startsWith(month)) results[date] = num;
+      for (const trM of trMatches) {
+        const trInner = trM[1];
+        // 取所有 td 的純文字
+        const tdMatches = [...trInner.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map(m => m[1].replace(/<[^>]+>/g, "").trim());
+
+        if (!tdMatches || tdMatches.length === 0) continue;
+
+        // 日期優先找 data-table="日期" 欄
+        let date = null;
+        const dateCellMatch = trInner.match(/<td\b[^>]*data-table=["']?日期["']?[^>]*>([\s\S]*?)<\/td>/i);
+        if (dateCellMatch) {
+          date = dateCellMatch[1].replace(/<[^>]+>/g, "").trim().replace(/\//g, "-");
+        } else {
+          // 若找不到 data-table，嘗試第一個或任何欄位匹配日期格式
+          const cand = tdMatches.find(c => /^\d{4}[\/-]\d{2}[\/-]\d{2}$/.test(c.replace(/\s+/g, "")));
+          if (cand) date = cand.replace(/\//g, "-");
+        }
+
+        if (!date) continue;
+
+        if (thIndex < 0 || thIndex >= tdMatches.length) continue;
+        const rawVal = tdMatches[thIndex];
+        const num = parseNumber(rawVal);
+        if (!Number.isFinite(num)) continue;
+        if (date.startsWith(month)) results[date] = num;
+      }
+
+      // 命中第一個符合表格後就停止搜尋其他 table
+      break;
+    }
+
+    if (found) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.status(200).json(results);
+    }
+
+    // 2) 表格解析失敗 → 回退到 data-local JSON 抽取（舊有穩定方案）
+    const dlMatch = html.match(/data-local=(['"])([\s\S]*?)\1/);
+    if (!dlMatch) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.status(502).json({
+        error: "表格解析與 data-local 皆失敗",
+        checks: debug
+      });
+    }
+
+    let decoded = htmlEntityDecode(dlMatch[2]);
+    let dataLocal;
+    try {
+      dataLocal = JSON.parse(decoded);
+    } catch (e) {
+      const fixed = fixJsonQuotes(decoded);
+      dataLocal = JSON.parse(fixed);
+    }
+
+    // 從 data-local 取 name 包含「本行賣出」或「即期」的 series
+    const series = Array.isArray(dataLocal.series) ? dataLocal.series : [];
+    const pick = series.find(s => s && typeof s.name === 'string' && /本行賣出|即期/.test(s.name))
+      || series.find(s => s && typeof s.name === 'string' && !/現金/.test(s.name))
+      || series[0];
+
+    if (!pick || !Array.isArray(pick.data)) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.status(502).json({
+        error: "data-local 存在但無合適 series",
+        seriesNames: series.map(s => (s && s.name) ? s.name : null)
+      });
+    }
+
+    const fallbackResults = {};
+    for (const point of pick.data) {
+      if (!Array.isArray(point) || point.length < 2) continue;
+      const [ts, rate] = point;
+      const date = msToDate(ts);
+      if (date.startsWith(month)) fallbackResults[date] = Number(rate);
     }
 
     res.setHeader("Access-Control-Allow-Origin", "*");
-    return res.status(200).json(results);
+    return res.status(200).json(fallbackResults);
+
   } catch (err) {
-    res.status(500).json({ error: "抓取失敗", details: err.message });
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    return res.status(500).json({ error: "抓取失敗", details: err.message });
   }
 }
